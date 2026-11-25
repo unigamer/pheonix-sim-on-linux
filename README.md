@@ -104,6 +104,14 @@ dialog. Pass `--allow-update-check` to leave the setting alone.
 `options.sim` is Latin-1 with CRLF line endings. Edit it byte-for-byte:
 Phoenix silently resets all options if the encoding changes.
 
+Some stock models crash Phoenix under Wine/Proton as soon as they are
+picked. They are listed in `BROKEN_MODELS` in `launcher.py`; so far that is
+only the F-117 flying wing, which faults on a bad texture pointer
+(`Simulator.exe+0x46CB69`). The launcher moves them out of the install into
+`<prefix>/removed-models/` so they don't appear in the model list.
+`./run.sh --keep-broken-models` moves them back, for example while working
+on a fix.
+
 If Phoenix says "Error initialising DirectX", check `logs/wine.log` for
 "The explorer process failed to start". Wine's X11 driver is crashing, and the
 launcher already sets `UseXRandR=N` to avoid the known case.

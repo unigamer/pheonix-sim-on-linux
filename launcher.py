@@ -43,6 +43,14 @@ CONFIG = HERE / "pheonix.json"
 GAME_DIRS = ("Program Files (x86)/PhoenixRC", "Program Files/PhoenixRC")
 # Microsoft's DirectX 9 helpers (install.py puts them next to Simulator.exe).
 # Wine's builtin d3dx9 can't compile Phoenix's shaders.
+# Stock models that crash Phoenix under Wine/Proton.  F117flyingWing: picking
+# it kills Simulator.exe with a page fault at 0x46CB69 (SetTexture on stage 2
+# with a texture pointer of 1, with DXVK and wined3d alike).  The launcher
+# moves these folders out of the game into <prefix>/removed-models so they
+# never show up in the model list; --keep-broken-models moves them back.
+BROKEN_MODELS = (
+    "resources/objects/aircraft/fixedWing/Electric/F117flyingWing",
+)
 NATIVE_DLLS = ("d3dx9_31", "d3dx9_43", "d3dcompiler_43")
 
 
@@ -96,6 +104,28 @@ def _stock_path(game: Path, rel: str) -> Path:
     return game / rel
 
 
+def _removed(rel: str) -> bool:
+    return any(rel == m or rel.startswith(m + "/") for m in BROKEN_MODELS)
+
+
+def set_broken_models(game: Path, prefix: Path, keep: bool) -> None:
+    """Move BROKEN_MODELS out of the game (keep=False) or back in (keep=True)."""
+    stash = prefix / "removed-models"
+    for rel in BROKEN_MODELS:
+        live, stashed = game / rel, stash / rel
+        src, dst = (stashed, live) if keep else (live, stashed)
+        if not src.is_dir():
+            continue
+        if dst.exists():
+            shutil.rmtree(src)  # already a copy where it belongs
+            continue
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        shutil.move(str(src), str(dst))
+        name = rel.rsplit("/", 1)[-1]
+        print(f"Restored model: {name}" if keep else
+              f"Removed crashing model: {name} (--keep-broken-models restores it)")
+
+
 def write_checksums(game: Path) -> None:
     rels = sorted(str(p.relative_to(game)) for p in game.rglob("*")
                   if p.is_file() and p.name != "Simulator.exe.bak"
@@ -110,7 +140,7 @@ def write_checksums(game: Path) -> None:
     print(f"Wrote {len(rels)} checksums to {CHECKSUMS}")
 
 
-def verify_game(game: Path) -> list[str]:
+def verify_game(game: Path, skip_broken: bool = True) -> list[str]:
     """Return a list of problems (empty = install matches checksums.sha256).
 
     Files not in the manifest (e.g. models downloaded later) are ignored.
@@ -121,7 +151,8 @@ def verify_game(game: Path) -> list[str]:
     for line in CHECKSUMS.read_text().splitlines():
         if line.strip():
             digest, rel = line.split("  ", 1)
-            entries.append((digest, rel))
+            if not (skip_broken and _removed(rel)):
+                entries.append((digest, rel))
 
     def check(entry):
         digest, rel = entry
@@ -477,6 +508,9 @@ def main() -> None:
                          "settings elsewhere; gamescope: always force it; keep: don't touch")
     ap.add_argument("--skip-verify", action="store_true",
                     help="run even if the game files don't match checksums.sha256")
+    ap.add_argument("--keep-broken-models", action="store_true",
+                    help="put back the models the launcher removes because they crash "
+                         "Phoenix (see BROKEN_MODELS), e.g. to work on a fix")
     ap.add_argument("--write-checksums", action="store_true",
                     help="record the current install as checksums.sha256 and exit")
     args = ap.parse_args()
@@ -487,11 +521,12 @@ def main() -> None:
     if args.write_checksums:
         write_checksums(game)
         return
+    set_broken_models(game, prefix, args.keep_broken_models)
     if args.skip_verify:
         print("Skipping game file verification (--skip-verify)")
     else:
         t0 = time.monotonic()
-        problems = verify_game(game)
+        problems = verify_game(game, skip_broken=not args.keep_broken_models)
         if problems:
             for p in problems[:20]:
                 print(f"  {p}", file=sys.stderr)
