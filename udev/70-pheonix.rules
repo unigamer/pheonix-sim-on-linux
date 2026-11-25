@@ -1,0 +1,14 @@
+# Pheonix (Phoenix RC under Wine/Proton) – software dongle access.
+#
+# Lets the logged-in desktop user create the virtual PhoenixRC dongle via
+# /dev/uhid and lets Wine open the resulting /dev/hidraw node.
+#
+# Install:  sudo install -m644 udev/70-pheonix.rules /etc/udev/rules.d/ \
+#           && sudo udevadm control --reload && sudo udevadm trigger
+#
+# Note: uhid access lets the local user create arbitrary virtual HID devices.
+
+KERNEL=="uhid", TAG+="uaccess"
+# Any bus: dongle.py registers as BUS_VIRTUAL (0006) so hid-pxrc leaves it alone.
+KERNEL=="hidraw*", KERNELS=="*:1781:0898.*", TAG+="uaccess"
+KERNEL=="hidraw*", ATTRS{idVendor}=="1781", ATTRS{idProduct}=="0898", TAG+="uaccess"

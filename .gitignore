@@ -1,0 +1,11 @@
+*.zip
+*.pkg
+prefix/
+logs/
+__pycache__/
+proton/
+pheonix.json
+phoenix.ico
+legacy/
+*.exe
+*.dll
