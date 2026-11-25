@@ -76,9 +76,15 @@ class DvdZip:
         n = 0
         with zipfile.ZipFile(self.path) as z:
             for info in z.infolist():
-                if info.is_dir() or not info.filename.startswith(self.root + sub):
+                if not info.filename.startswith(self.root + sub):
                     continue
                 target = dest / info.filename[len(self.root + sub):]
+                if info.is_dir():
+                    # Keep empty folders: Phoenix can't create e.g.
+                    # Settings/mappingProfiles/Custom itself and quits when
+                    # saving a new profile there.
+                    target.mkdir(parents=True, exist_ok=True)
+                    continue
                 target.parent.mkdir(parents=True, exist_ok=True)
                 with z.open(info) as src, open(target, "wb") as out:
                     shutil.copyfileobj(src, out, 1 << 20)

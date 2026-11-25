@@ -26,6 +26,7 @@ import shutil
 import signal
 import subprocess
 import sys
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -142,6 +143,38 @@ def proton_bin(proton: Path, name: str) -> Path:
     return proton / "files/bin" / name
 
 
+def steam_runtime(proton: Path, steam_root: Path) -> Path | None:
+    """The container entry point Proton's toolmanifest asks for.
+
+    Steam never runs Proton bare: it starts it inside a Steam Linux Runtime
+    container (Proton 11 -> SteamLinuxRuntime_4).  Run bare, Proton uses the
+    host's libraries, and in Game Mode gamescope stopped showing new frames
+    after Phoenix's loading screen while the game kept running."""
+    try:
+        manifest = (proton / "toolmanifest.vdf").read_text()
+    except OSError:
+        return None
+    m = re.search(r'"require_tool_appid"\s+"(\d+)"', manifest)
+    if not m:
+        return None
+    libraries = [steam_root / "steamapps"]
+    try:
+        vdf = (steam_root / "steamapps/libraryfolders.vdf").read_text()
+        libraries += [Path(p) / "steamapps" for p in re.findall(r'"path"\s+"([^"]+)"', vdf)]
+    except OSError:
+        pass
+    for lib in libraries:
+        try:
+            acf = (lib / f"appmanifest_{m.group(1)}.acf").read_text()
+        except OSError:
+            continue
+        d = re.search(r'"installdir"\s+"([^"]+)"', acf)
+        entry = lib / "common" / d.group(1) / "_v2-entry-point" if d else None
+        if entry and entry.exists():
+            return entry
+    return None
+
+
 def wine_env(args, prefix: Path) -> tuple[list[str], dict]:
     """Command prefix to run a Windows program, and its environment."""
     env = dict(os.environ)
@@ -159,8 +192,17 @@ def wine_env(args, prefix: Path) -> tuple[list[str], dict]:
                        args.steam_root or str(Path.home() / ".local/share/Steam"))
         # Proton: let winebus open our dongle's hidraw node.
         env["PROTON_ENABLE_HIDRAW"] = "0x1781/0x0898"
+        # In Game Mode Proton starts xalia (gamepad navigation for dialogs).
+        # It hooks Phoenix's startup dialogs, and once one is dismissed the
+        # game window never gets focus/input, so Phoenix looks frozen.
+        env.setdefault("PROTON_USE_XALIA", "0")
         env["WINEPREFIX"] = str(prefix)  # only used for 'wineserver -k'
         env["PHEONIX_WINESERVER"] = str(proton_bin(proton, "wineserver"))
+        runtime = None if args.no_runtime else steam_runtime(
+            proton, Path(env["STEAM_COMPAT_CLIENT_INSTALL_PATH"]))
+        if runtime:
+            print(f"Steam Linux Runtime: {runtime.parent.name}")
+            return [str(runtime), "--verb=run", "--", str(proton / "proton"), "run"], env
         return [str(proton / "proton"), "run"], env
     env["WINEPREFIX"] = str(prefix)
     env["PHEONIX_WINESERVER"] = "wineserver"
@@ -179,10 +221,14 @@ def win_path(path: Path) -> str:
 REG_SETTINGS = r"""Windows Registry Editor Version 5.00
 
 ; Wine 9: the udev (hidraw) backend only runs when SDL is disabled.
+; DisableInput turns off the evdev backend, so Phoenix doesn't see ordinary
+; gamepads (e.g. Steam Input's virtual "X-Box 360 pad" for the Deck's own
+; controls, which can't be switched off).  dongle.py reads those directly
+; and our dongle has no evdev node – it reaches Wine through hidraw only.
 [HKEY_LOCAL_MACHINE\System\CurrentControlSet\Services\winebus]
 "Enable SDL"=dword:00000000
 "DisableHidraw"=dword:00000000
-"DisableInput"=dword:00000000
+"DisableInput"=dword:00000001
 
 ; Wine 9's XRandR 1.4 code crashes explorer.exe on some hybrid Intel/NVIDIA
 ; X setups ("The explorer process failed to start" -> Phoenix reports "Error
@@ -231,6 +277,182 @@ def disable_update_check(prefix: Path) -> None:
             print(f"Disabled startup update check in {opts}")
 
 
+def in_gamescope() -> bool:
+    """True in Steam Deck Game Mode (or any gamescope session)."""
+    return (os.environ.get("XDG_CURRENT_DESKTOP", "").lower() == "gamescope"
+            or "GAMESCOPE_WAYLAND_DISPLAY" in os.environ)
+
+
+# Phoenix's display options and the values we force under gamescope.  Phoenix
+# normally starts windowed and maximizes its window once the start screen is
+# dismissed; gamescope doesn't follow that resize and keeps showing the last
+# frame, so the game looks frozen.  Exclusive fullscreen at the size gamescope
+# gives the game is what gamescope expects.
+GAMESCOPE_DISPLAY = {
+    "default_fullscreen": b"1",
+    "default_windowState": b"0",
+    "default_screenRefresh": b"60",
+}
+DECK_PANEL = (1280, 800)
+
+
+def gamescope_size() -> tuple[int, int]:
+    """The game's Xwayland screen size in Game Mode.
+
+    That's Steam's per-game "Game Resolution" (e.g. 1280x720 when docked,
+    unless set to Native), not the monitor's; gamescope scales it up to the
+    output.  Rendering at anything else just gets rescaled again."""
+    try:
+        out = subprocess.run(["xwininfo", "-root"], capture_output=True,
+                             text=True, timeout=5).stdout
+        m = re.search(r"Width: (\d+).*?Height: (\d+)", out, re.S)
+        if m:
+            return int(m.group(1)), int(m.group(2))
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+    return DECK_PANEL
+DESKTOP_DISPLAY_BACKUP = HERE / "logs" / "desktop-display.json"
+
+
+def _set_option(data: bytes, key: str, value: bytes) -> tuple[bytes, bytes | None]:
+    """Replace 'options.<key> = <old>' with value; return (data, old)."""
+    pat = re.compile(rb"(options\." + re.escape(key.encode()) + rb" = )(-?\d+)")
+    m = pat.search(data)
+    if not m:
+        return data, None
+    return data[:m.start(2)] + value + data[m.end(2):], m.group(2)
+
+
+def set_display_mode(prefix: Path, gamescope: bool) -> None:
+    """Force fullscreen at gamescope's size under gamescope; restore the
+    user's own display settings on the next desktop run."""
+    forced = dict(GAMESCOPE_DISPLAY)
+    if gamescope:
+        w, h = gamescope_size()
+        forced["default_screenResolution_x"] = str(w).encode()
+        forced["default_screenResolution_y"] = str(h).encode()
+    for opts in (prefix / "drive_c/users").glob("*/Documents/PhoenixRC/Settings/options.sim"):
+        data = opts.read_bytes()  # bytes: Latin-1 + CRLF must survive untouched
+        if gamescope:
+            saved = {}
+            for key, value in forced.items():
+                data, old = _set_option(data, key, value)
+                if old is not None:
+                    saved[key] = old.decode()
+            # Keep the first backup: a second Game Mode run would otherwise
+            # back up our own forced values.
+            if not DESKTOP_DISPLAY_BACKUP.exists():
+                DESKTOP_DISPLAY_BACKUP.parent.mkdir(exist_ok=True)
+                DESKTOP_DISPLAY_BACKUP.write_text(json.dumps(saved))
+            msg = f"Game Mode: Phoenix set to fullscreen {w}x{h}"
+        else:
+            if not DESKTOP_DISPLAY_BACKUP.exists():
+                continue
+            for key, value in json.loads(DESKTOP_DISPLAY_BACKUP.read_text()).items():
+                data, _ = _set_option(data, key, value.encode())
+            msg = "Desktop: restored Phoenix's previous display settings"
+        if data != opts.read_bytes():
+            opts.write_bytes(data)
+            print(msg)
+    if not gamescope:
+        DESKTOP_DISPLAY_BACKUP.unlink(missing_ok=True)
+
+
+GAMESCOPE_ROOT_ATOMS = ("GAMESCOPE_FOCUSED_WINDOW", "GAMESCOPE_FOCUSED_APP",
+                        "GAMESCOPE_FOCUSED_APP_GFX", "GAMESCOPE_FOCUSABLE_WINDOWS",
+                        "GAMESCOPE_FOCUSABLE_APPS", "_NET_ACTIVE_WINDOW")
+
+
+def _run_text(cmd: list[str], env: dict) -> str:
+    try:
+        return subprocess.run(cmd, env=env, capture_output=True, text=True,
+                              timeout=5).stdout
+    except (OSError, subprocess.TimeoutExpired) as e:
+        return f"<{cmd[0]} failed: {e}>\n"
+
+
+def _xprops(wid: str, env: dict) -> str:
+    props = _run_text(["xprop", "-id", wid, "STEAM_GAME", "WM_CLASS",
+                       "_NET_WM_STATE", "WM_TRANSIENT_FOR"], env)
+    kept = [p.strip() for p in props.splitlines()
+            if "not found" not in p and "no such atom" not in p]
+    if not any(p.startswith("STEAM_GAME") for p in kept):
+        kept.insert(0, "STEAM_GAME=none")
+    return " | ".join(kept)
+
+
+def _gamescope_snapshot(env: dict, diag: Path | None) -> str:
+    """Which window gamescope focuses, and Wine's X windows.
+
+    gamescope publishes its focus atoms on the root of Steam's own Xwayland
+    (:0); the game usually runs on a second one (:1), so query both."""
+    out = []
+    steam_env = dict(env, DISPLAY=":0")
+    out.append("[:0 root]\n" + _run_text(["xprop", "-root", *GAMESCOPE_ROOT_ATOMS], steam_env))
+    if env.get("DISPLAY") != ":0":
+        out.append(f"[{env.get('DISPLAY')} root]\n"
+                   + _run_text(["xprop", "-root", *GAMESCOPE_ROOT_ATOMS], env))
+    root = _run_text(["xwininfo", "-root"], env)
+    size = re.search(r"Width: (\d+).*?Height: (\d+)", root, re.S)
+    out.append(f"root size: {size.group(1)}x{size.group(2)}\n" if size else "root size: ?\n")
+    tree = _run_text(["xwininfo", "-root", "-children"], env)
+    for line in tree.splitlines():
+        m = re.match(r"\s+(0x[0-9a-f]+) (.*)", line)
+        if not m or "steamwebhelper" in line:
+            continue
+        wid = m.group(1)
+        info = _run_text(["xwininfo", "-id", wid], env)
+        state = re.search(r"Map State: (\S+)", info)
+        state = state.group(1) if state else "?"
+        out.append(f"  {wid} {state} {m.group(2)}\n      {_xprops(wid, env)}\n")
+        if state != "IsViewable":
+            continue
+        # Wine draws Vulkan/DXVK output into a child "client" window; that's
+        # the xid gamescope WSI attaches its surface to (see wine.log).
+        kids = _run_text(["xwininfo", "-id", wid, "-children"], env)
+        for kline in kids.splitlines():
+            k = re.match(r"\s+(0x[0-9a-f]+) (.*)", kline)
+            if not k:
+                continue
+            kinfo = _run_text(["xwininfo", "-id", k.group(1)], env)
+            kstate = re.search(r"Map State: (\S+)", kinfo)
+            out.append(f"      child {k.group(1)} {kstate.group(1) if kstate else '?'} "
+                       f"{k.group(2)}\n")
+    if diag and diag.exists():
+        try:
+            lines = diag.read_bytes().splitlines()
+            out.append(f"Diagnostic.log: {lines[-1].decode('latin-1').strip() if lines else ''}\n")
+        except OSError:
+            pass
+    return "".join(out)
+
+
+def gamescope_logger(env: dict, prefix: Path, log: Path, stop: threading.Event) -> None:
+    """Every 2 s, append the gamescope/X window state to log when it changes.
+
+    Diagnostic aid for Game Mode, where Phoenix keeps running but gamescope
+    keeps showing a stale frame."""
+    if not (shutil.which("xprop") and shutil.which("xwininfo")):
+        log.write_text("xprop/xwininfo not found – no gamescope logging\n")
+        return
+    diag = next(iter((prefix / "drive_c/users").glob(
+        "*/Documents/PhoenixRC/Diagnostic.log")), None)
+    keys = ("DISPLAY", "WAYLAND_DISPLAY", "GAMESCOPE_WAYLAND_DISPLAY",
+            "XDG_CURRENT_DESKTOP", "SteamAppId", "SteamGameId", "STEAM_COMPAT_APP_ID",
+            "ENABLE_GAMESCOPE_WSI", "PROTON_USE_XALIA")
+    t0 = time.monotonic()
+    last = None
+    with open(log, "w") as f:
+        f.write("".join(f"{k}={env.get(k)}\n" for k in keys))
+        while not stop.is_set():
+            snap = _gamescope_snapshot(env, diag)
+            if snap != last:
+                f.write(f"\n=== t={time.monotonic() - t0:.1f}s\n{snap}")
+                f.flush()
+                last = snap
+            stop.wait(2)
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -246,8 +468,13 @@ def main() -> None:
     ap.add_argument("--map", help="axis map passed to dongle.py")
     ap.add_argument("--no-dongle", action="store_true", help="don't start dongle.py")
     ap.add_argument("--debug", action="store_true", help="WINEDEBUG=+hid")
+    ap.add_argument("--no-runtime", action="store_true",
+                    help="Proton: run it bare instead of inside its Steam Linux Runtime")
     ap.add_argument("--allow-update-check", action="store_true",
                     help="don't untick Phoenix's startup update check")
+    ap.add_argument("--display", choices=["auto", "gamescope", "keep"], default="auto",
+                    help="auto: fullscreen at gamescope's resolution in Steam Deck Game Mode, your own "
+                         "settings elsewhere; gamescope: always force it; keep: don't touch")
     ap.add_argument("--skip-verify", action="store_true",
                     help="run even if the game files don't match checksums.sha256")
     ap.add_argument("--write-checksums", action="store_true",
@@ -277,6 +504,10 @@ def main() -> None:
     patch_exe(sim)
     if not args.allow_update_check:
         disable_update_check(prefix)
+    if args.display == "auto":
+        set_display_mode(prefix, in_gamescope() and not args.xvfb)
+    elif args.display == "gamescope":
+        set_display_mode(prefix, True)
 
     logs = HERE / "logs"
     logs.mkdir(exist_ok=True)
@@ -296,6 +527,7 @@ def main() -> None:
                 c.kill()
 
     signal.signal(signal.SIGTERM, lambda *a: (cleanup(), sys.exit(0)))
+    stop_log = threading.Event()  # ends the Game Mode window logger
 
     try:
         if not args.no_dongle:
@@ -325,6 +557,16 @@ def main() -> None:
         kill_wine.append(env)
         configure_wine(wine, env, logs)
 
+        if in_gamescope() and not args.xvfb:
+            # PHEONIX_GAMESCOPE_WSI=0 in Steam's launch options presents DXVK
+            # frames through plain Xwayland instead of gamescope's Vulkan WSI
+            # layer (Steam exports ENABLE_GAMESCOPE_WSI=1 in Game Mode).
+            if "PHEONIX_GAMESCOPE_WSI" in os.environ:
+                env["ENABLE_GAMESCOPE_WSI"] = os.environ["PHEONIX_GAMESCOPE_WSI"]
+            log_env = {k: v for k, v in env.items() if k != "LD_PRELOAD"}
+            threading.Thread(target=gamescope_logger, daemon=True,
+                             args=(log_env, prefix, logs / "gamescope.log", stop_log)).start()
+
         print(f"Launching {sim}")
         with open(logs / "wine.log", "w") as wlog:
             game = subprocess.Popen(wine + [str(sim)], cwd=sim.parent, env=env,
@@ -333,6 +575,7 @@ def main() -> None:
     except KeyboardInterrupt:
         pass
     finally:
+        stop_log.set()
         cleanup()
 
 
