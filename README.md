@@ -45,7 +45,7 @@ You need your own copy of these two Phoenix files (they are not in this repo):
 Put them in one folder, then:
 
 ```
-git clone https://github.com/unigamer/pheonix.git && cd pheonix
+git clone https://github.com/unigamer/pheonix-sim-on-linux.git && cd pheonix-sim-on-linux
 ./install.sh ~/Downloads/phoenix      # the folder with your two files
 ./run.sh
 ```
